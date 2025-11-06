@@ -6,8 +6,9 @@
 from datetime import datetime
 from functools import reduce
 from http import HTTPStatus
+from io import BytesIO
 from json import dumps, loads
-from os import linesep
+from os import linesep, makedirs, path
 from time import sleep
 from typing import Dict, List, Tuple
 import uuid
@@ -75,6 +76,84 @@ def get_combined_redacted_content(channel: int) -> Dict:
         "itn": "",
         "lexical": ""
     }
+
+
+def get_speaker_segregated_phrases(transcription: Dict) -> List[Dict]:
+    """
+    Create speaker-segregated conversation text organized by format type.
+    Groups consecutive utterances by speaker and formats them as a conversation.
+    
+    Returns:
+        List of dictionaries with channel and text in multiple formats
+    """
+    recognized_phrases = transcription.get("recognizedPhrases", [])
+    
+    if not recognized_phrases:
+        return [{
+            "channel": 0,
+            "lexical": "",
+            "itn": "",
+            "maskedITN": "",
+            "display": ""
+        }]
+    
+    # Build conversation lines with speaker labels
+    conversation_lines_lexical = []
+    conversation_lines_itn = []
+    conversation_lines_masked_itn = []
+    conversation_lines_display = []
+    
+    current_speaker = None
+    current_text_lexical = []
+    current_text_itn = []
+    current_text_masked_itn = []
+    current_text_display = []
+    
+    for phrase in recognized_phrases:
+        speaker = phrase.get("speaker")
+        
+        # Get the best transcription from nBest
+        if phrase.get("nBest") and len(phrase["nBest"]) > 0:
+            best = phrase["nBest"][0]
+            
+            # If same speaker, accumulate text
+            if speaker == current_speaker:
+                current_text_lexical.append(best.get("lexical", ""))
+                current_text_itn.append(best.get("itn", ""))
+                current_text_masked_itn.append(best.get("maskedITN", ""))
+                current_text_display.append(best.get("display", ""))
+            else:
+                # Different speaker - save previous speaker's text if exists
+                if current_speaker is not None:
+                    conversation_lines_lexical.append(f"Speaker {current_speaker}: {' '.join(current_text_lexical)}")
+                    conversation_lines_itn.append(f"Speaker {current_speaker}: {' '.join(current_text_itn)}")
+                    conversation_lines_masked_itn.append(f"Speaker {current_speaker}: {' '.join(current_text_masked_itn)}")
+                    conversation_lines_display.append(f"Speaker {current_speaker}: {' '.join(current_text_display)}")
+                
+                # Start new speaker
+                current_speaker = speaker
+                current_text_lexical = [best.get("lexical", "")]
+                current_text_itn = [best.get("itn", "")]
+                current_text_masked_itn = [best.get("maskedITN", "")]
+                current_text_display = [best.get("display", "")]
+    
+    # Add the last speaker's text
+    if current_speaker is not None:
+        conversation_lines_lexical.append(f"Speaker {current_speaker}: {' '.join(current_text_lexical)}")
+        conversation_lines_itn.append(f"Speaker {current_speaker}: {' '.join(current_text_itn)}")
+        conversation_lines_masked_itn.append(f"Speaker {current_speaker}: {' '.join(current_text_masked_itn)}")
+        conversation_lines_display.append(f"Speaker {current_speaker}: {' '.join(current_text_display)}")
+    
+    # Get channel from first phrase (assuming single channel for now)
+    channel = recognized_phrases[0].get("channel", 0) if recognized_phrases else 0
+    
+    return [{
+        "channel": channel,
+        "lexical": "\n".join(conversation_lines_lexical),
+        "itn": "\n".join(conversation_lines_itn),
+        "maskedITN": "\n".join(conversation_lines_masked_itn),
+        "display": "\n".join(conversation_lines_display)
+    }]
 
 
 def create_transcription(user_config: helper.Read_Only_Dict) -> str:
@@ -429,8 +508,241 @@ def print_full_output(output_file_path: str, transcription: Dict, sentiment_conf
         "transcription": merge_sentiment_confidence_scores_into_transcription(transcription, sentiment_confidence_scores),
         "conversationAnalyticsResults": get_conversation_analysis_for_full_output(phrases, conversation_analysis)
     }
+    # Create output directory if it doesn't exist
+    output_dir = path.dirname(output_file_path)
+    if output_dir and not path.exists(output_dir):
+        makedirs(output_dir)
     with open(output_file_path, mode="w", newline="") as f:
         f.write(dumps(results, indent=2))
+
+
+def upload_to_blob_storage(container_url: str, blob_name: str, content: str) -> bool:
+    """Upload JSON content to Azure Blob Storage."""
+    try:
+        from azure.storage.blob import BlobClient
+    except ImportError:
+        raise ImportError(
+            "Azure Storage Blob library is required for blob upload.\n"
+            "Install it with: pip install azure-storage-blob"
+        )
+    
+    try:
+        # Extract SAS token from container URL if present
+        if '?' in container_url:
+            base_url = container_url.split('?')[0]
+            sas_token = '?' + container_url.split('?')[1]
+        else:
+            base_url = container_url
+            sas_token = ""
+        
+        # Construct blob URL
+        blob_url = f"{base_url.rstrip('/')}/{blob_name}{sas_token}"
+        
+        # Create blob client and upload
+        blob_client = BlobClient.from_blob_url(blob_url)
+        content_bytes = content.encode('utf-8')
+        blob_client.upload_blob(BytesIO(content_bytes), overwrite=True)
+        
+        return True
+    except Exception as e:
+        print(f"Failed to upload to blob storage: {str(e)}")
+        return False
+
+
+def export_speaker_conversation_to_txt(transcription: Dict, json_file_path: str) -> None:
+    """Export speaker-segregated conversation to a single plain text file with all formats."""
+    if not transcription.get("combinedRecognizedPhrases"):
+        return
+    
+    # Get base filename without extension
+    base_path = json_file_path.rsplit('.', 1)[0]
+    txt_file_path = f"{base_path}.txt"
+    
+    # Get the speaker-segregated phrases
+    combined_phrases = transcription["combinedRecognizedPhrases"][0]
+    
+    formats = [
+        ('LEXICAL (Raw Text)', 'lexical'),
+        ('ITN (Inverse Text Normalization)', 'itn'),
+        ('MASKED ITN (Profanity Masked)', 'maskedITN'),
+        ('DISPLAY (Final Output)', 'display')
+    ]
+    
+    with open(txt_file_path, 'w', encoding='utf-8') as f:
+        f.write("=" * 80 + "\n")
+        f.write("SPEAKER-SEGREGATED CONVERSATION\n")
+        f.write("=" * 80 + "\n\n")
+        
+        for format_title, format_key in formats:
+            if format_key in combined_phrases:
+                f.write("-" * 80 + "\n")
+                f.write(f"{format_title}\n")
+                f.write("-" * 80 + "\n")
+                f.write(combined_phrases[format_key])
+                f.write("\n\n")
+    
+    print(f"  ✓ Exported speaker conversation to: {path.basename(txt_file_path)}")
+
+
+def list_blob_files(container_url: str) -> List[str]:
+    """List all audio files in the blob container."""
+    try:
+        from azure.storage.blob import ContainerClient
+    except ImportError:
+        raise ImportError(
+            "Azure Storage Blob library is required for container batch processing.\n"
+            "Install it with: pip install azure-storage-blob"
+        )
+    
+    audio_extensions = ('.wav', '.mp3', '.ogg', '.flac', '.m4a', '.wma', '.aac')
+    audio_files = []
+    
+    try:
+        container_client = ContainerClient.from_container_url(container_url)
+        blob_list = container_client.list_blobs()
+        
+        # Extract SAS token from container URL if present
+        sas_token = ""
+        if '?' in container_url:
+            base_url = container_url.split('?')[0]
+            sas_token = '?' + container_url.split('?')[1]
+        else:
+            base_url = container_url
+        
+        for blob in blob_list:
+            if blob.name.lower().endswith(audio_extensions):
+                # Construct blob URL with SAS token
+                blob_url = f"{base_url.rstrip('/')}/{blob.name}{sas_token}"
+                audio_files.append(blob_url)
+        
+        return audio_files
+    except Exception as e:
+        raise Exception(f"Failed to list blobs in container: {str(e)}")
+
+
+def process_single_audio(audio_url: str, user_config: helper.Read_Only_Dict, 
+                        output_file_path: str = None) -> Dict:
+    """Process a single audio file and return transcription."""
+    # Create a temporary config for this audio file
+    temp_config = dict(user_config)
+    temp_config["input_audio_url"] = audio_url
+    temp_config = helper.Read_Only_Dict(temp_config)
+    
+    transcription_id = create_transcription(temp_config)
+    wait_for_transcription(transcription_id, temp_config)
+    print(f"Transcription ID: {transcription_id}")
+    transcription_files = get_transcription_files(transcription_id, temp_config)
+    transcription_uri = get_transcription_uri(transcription_files, temp_config)
+    transcription = get_transcription(transcription_uri)
+    
+    # Sort phrases by offset
+    transcription["recognizedPhrases"] = sorted(
+        transcription["recognizedPhrases"],
+        key=lambda phrase: phrase["offsetInTicks"]
+    )
+    
+    # Replace original combinedRecognizedPhrases with speaker-segregated conversation
+    transcription["combinedRecognizedPhrases"] = get_speaker_segregated_phrases(transcription)
+    
+    phrases = get_transcription_phrases(transcription, temp_config)
+    
+    # Perform conversation analysis if language credentials provided
+    if temp_config.get("language_subscription_key") and temp_config.get("language_endpoint"):
+        sentiment_analysis_results = get_sentiment_analysis(phrases, temp_config)
+        sentiment_confidence_scores = get_sentiment_confidence_scores(sentiment_analysis_results)
+        conversation_items = transcription_phrases_to_conversation_items(phrases)
+        conversation_analysis_url = request_conversation_analysis(conversation_items, temp_config)
+        wait_for_conversation_analysis(conversation_analysis_url, temp_config)
+        conversation_analysis = get_conversation_analysis(conversation_analysis_url, temp_config)
+        
+        if output_file_path:
+            print_full_output(output_file_path, transcription, sentiment_confidence_scores, 
+                            phrases, conversation_analysis)
+            
+            # Upload to blob storage if output container URL is provided
+            if temp_config.get("output_container_url"):
+                blob_name = path.basename(output_file_path)
+                results = {
+                    "transcription": merge_sentiment_confidence_scores_into_transcription(transcription, sentiment_confidence_scores),
+                    "conversationAnalyticsResults": get_conversation_analysis_for_full_output(phrases, conversation_analysis)
+                }
+                json_content = dumps(results, indent=2)
+                if upload_to_blob_storage(temp_config["output_container_url"], blob_name, json_content):
+                    print(f"  ✓ Uploaded to blob storage: {blob_name}")
+                else:
+                    print(f"  ⚠️  Failed to upload to blob storage: {blob_name}")
+    else:
+        # Transcription only
+        if output_file_path:
+            output_dir = path.dirname(output_file_path)
+            if output_dir and not path.exists(output_dir):
+                makedirs(output_dir)
+            with open(output_file_path, 'w', encoding='utf-8') as f:
+                f.write(dumps(transcription, indent=2))
+            
+            # Export speaker-segregated conversation to plain text file
+            if "combinedRecognizedPhrases" in transcription and transcription["combinedRecognizedPhrases"]:
+                export_speaker_conversation_to_txt(transcription, output_file_path)
+        
+        # Upload to blob storage if output container URL is provided
+        if temp_config.get("output_container_url") and output_file_path:
+            blob_name = path.basename(output_file_path)
+            json_content = dumps(transcription, indent=2)
+            if upload_to_blob_storage(temp_config["output_container_url"], blob_name, json_content):
+                print(f"  ✓ Uploaded to blob storage: {blob_name}")
+            else:
+                print(f"  ⚠️  Failed to upload to blob storage: {blob_name}")
+    
+    # Clean up transcription
+    delete_transcription(transcription_id, temp_config)
+    
+    return transcription
+
+
+def process_container_batch(user_config: helper.Read_Only_Dict) -> None:
+    """Process all audio files in a blob container."""
+    container_url = user_config["container_url"]
+    output_folder = user_config["output_folder"]
+    
+    print(f"Listing audio files in container: {container_url}")
+    audio_files = list_blob_files(container_url)
+    
+    if not audio_files:
+        print("No audio files found in container.")
+        return
+    
+    print(f"Found {len(audio_files)} audio file(s) to process.\n")
+    
+    # Create output folder if it doesn't exist
+    if not path.exists(output_folder):
+        makedirs(output_folder)
+    
+    success_count = 0
+    failed_count = 0
+    
+    for index, audio_url in enumerate(audio_files, 1):
+        # Extract filename from URL (remove SAS query parameters for display)
+        url_path = audio_url.split('?')[0] if '?' in audio_url else audio_url
+        filename = url_path.split('/')[-1]
+        base_name = path.splitext(filename)[0]
+        output_file = path.join(output_folder, f"{base_name}_transcription.json")
+        
+        print(f"[{index}/{len(audio_files)}] Processing: {filename}")
+        print(f"  Audio URL: {audio_url}")
+        
+        try:
+            process_single_audio(audio_url, user_config, output_file)
+            print(f"✓ Successfully processed: {filename}")
+            print(f"  Output saved to: {output_file}\n")
+            success_count += 1
+        except Exception as e:
+            print(f"✗ Failed to process {filename}: {str(e)}\n")
+            failed_count += 1
+    
+    print(f"\n=== Batch Processing Complete ===")
+    print(f"Total files: {len(audio_files)}")
+    print(f"Successful: {success_count}")
+    print(f"Failed: {failed_count}")
 
 
 def run() -> None:
@@ -439,12 +751,39 @@ def run() -> None:
   HELP
     --help                          Show this help and stop.
 
+  ENVIRONMENT VARIABLES (.env file support)
+    You can store credentials in a .env file instead of passing them via command line.
+    Create a .env file in the same directory with the following format:
+    
+      SPEECH_KEY=your_speech_key
+      SPEECH_REGION=your_region
+      LANGUAGE_KEY=your_language_key (optional)
+      LANGUAGE_ENDPOINT=your_language_endpoint (optional)
+    
+    Command line arguments override .env values.
+    See .env.example for a template.
+
   CONNECTION
-    --speechKey KEY                 Your Azure Speech service subscription key. Required unless --jsonInput is present.
-    --speechRegion REGION           Your Azure Speech service region. Required unless --jsonInput is present.
-                                    Examples: westus, eastus
-    --languageKey KEY               Your Azure Cognitive Language subscription key. Optional (required for conversation analytics).
-    --languageEndpoint ENDPOINT     Your Azure Cognitive Language endpoint. Optional (required for conversation analytics).
+    --speechKey KEY                 Your Azure Speech service subscription key.
+                                    Can be set via SPEECH_KEY in .env file.
+                                    Command line value takes priority over .env.
+                                    Required unless --jsonInput is present.
+    --speechRegion REGION           Your Azure Speech service region.
+                                    Can be set via SPEECH_REGION in .env file.
+                                    Command line value takes priority over .env.
+                                    Required unless --jsonInput is present.
+                                    Examples: westus, eastus, centralindia
+    --useTextAnalytics              Enable conversation analytics (sentiment, summary, PII).
+                                    If not specified, only transcription is performed.
+                                    Requires --languageKey and --languageEndpoint (or .env equivalents).
+    --languageKey KEY               Your Azure Cognitive Language subscription key.
+                                    Can be set via LANGUAGE_KEY in .env file.
+                                    Command line value takes priority over .env.
+                                    Only used if --useTextAnalytics is specified.
+    --languageEndpoint ENDPOINT     Your Azure Cognitive Language endpoint.
+                                    Can be set via LANGUAGE_ENDPOINT in .env file.
+                                    Command line value takes priority over .env.
+                                    Only used if --useTextAnalytics is specified.
 
   LANGUAGE
     --language LANGUAGE             The language to use for sentiment analysis and conversation analysis.
@@ -454,6 +793,8 @@ def run() -> None:
                                     Default: en-US
                                     Ignored if --candidateLocales is provided.
     --candidateLocales LOCALES      Comma-separated list of locales for multi-language detection.
+                                    Can be set via CANDIDATE_LOCALES in .env file.
+                                    Command line value takes priority over .env.
                                     Example: en-US,es-ES,fr-FR
                                     If provided, enables automatic language identification.
     --languageIdMode MODE           Language identification mode: 'Single' or 'Continuous'.
@@ -469,19 +810,42 @@ def run() -> None:
                                     Use 'GET /speechtotext/models/base' API to list available Whisper models.
 
   INPUT
-    --input URL                     Input audio from URL. Required unless --jsonInput is present.
+    --input URL                     Input audio from URL. Required unless --jsonInput or --containerUrl is present.
     --jsonInput FILE                Input JSON Speech batch transcription result from FILE. Overrides --input.
+    --containerUrl URL              Azure Blob Storage container URL with SAS token for batch processing.
+                                    All audio files in the container will be processed.
+                                    Can be set via CONTAINER_URL in .env file.
+                                    Command line value takes priority over .env.
+                                    Example: https://account.blob.core.windows.net/container?sas_token
+                                    Requires: pip install azure-storage-blob
     --stereo                        Use stereo audio format.
                                     If this is not present, mono is assumed.
 
   OUTPUT
-    --output FILE                   Output phrase list and conversation summary to text file.
+    --output FILE                   Output phrase list and conversation summary to text file (single file mode).
+    --outputFolder FOLDER           Output folder for batch processing results (used with --containerUrl).
+                                    Can be set via OUTPUT_FOLDER in .env file.
+                                    Command line value takes priority over .env.
+                                    Default: output
+    --outputContainerUrl URL        Azure Blob Storage container URL with SAS token for uploading results.
+                                    Results will be uploaded to this container in addition to local storage.
+                                    Can be set via OUTPUT_CONTAINER_URL in .env file.
+                                    Command line value takes priority over .env.
+                                    Example: https://account.blob.core.windows.net/results?sas_token
+                                    Requires write permissions on the SAS token.
+                                    Requires: pip install azure-storage-blob
 """
 
     if user_config_helper.cmd_option_exists("--help"):
         print(usage)
     else:
         user_config = user_config_helper.user_config_from_args(usage)
+        
+        # Check if batch processing mode (container URL provided)
+        if user_config.get("container_url"):
+            process_container_batch(user_config)
+            return
+        
         transcription: Dict
         transcription_id: str
         if user_config["input_file_path"] is not None:
